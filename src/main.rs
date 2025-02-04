@@ -1,26 +1,45 @@
 
 mod selectable;
+mod orbit;
+mod camera;
+mod earth;
+mod propagation;
+pub mod global;
 
-use bevy::prelude::*;
+use std::time::Duration;
+
+use bevy::{color::palettes::css::*, prelude::*};
+use camera::{CameraLock, StaticLockSettings};
+use earth::{AssetPrepared, LoadAndScaleEarthModelPlugin};
+use global::{InGameSettings, PropagationSettings};
+use orbit::{Propagatable, SatelliteOrbit};
 use selectable::*;
 
 #[derive(Clone, Eq, PartialEq, Debug, Hash, Default, States)]
 enum GameState {
     #[default]
+    Loading,
     Playing,
     GameOver,
 }
 
 fn main() {
     App::new()
+        .insert_resource(InGameSettings { scale: 0.01, simulation_speed: 1000.0, propagation: PropagationSettings { real_time_interval: Duration::from_secs(2), batch_size: 50 } })
+        .insert_resource(propagation::ConstFileClient::new("assets/".into()))
         .add_plugins(DefaultPlugins)
+        .add_plugins(LoadAndScaleEarthModelPlugin::<Earth>::new(127.56))
+        .add_plugins(propagation::LoadElementsPlugin::<propagation::ConstFileClient>::new())
+        .add_plugins(propagation::PropagateElementsPlugin)
+        .add_plugins(propagation::PropagateInGamePlugin)
         .init_resource::<Game>()
         .init_state::<GameState>()
-        .add_systems(Startup, setup_cameras)
+        .add_systems(Startup, (setup_cameras, load_data))
+        .add_systems(Update, transition_to_playing.run_if(in_state(GameState::Loading)))
         .add_systems(OnEnter(GameState::Playing), setup)
         .add_systems(Update, change_focus.run_if(in_state(GameState::Playing)))
         .add_systems(Update, 
-            (propagate_orbit, move_camera)
+            (propagete_actual_orbit, move_camera, draw_orbits)
                 .run_if(in_state(GameState::Playing)))
         .add_systems(
             Update,
@@ -32,17 +51,7 @@ fn main() {
 
 #[derive(Default)]
 struct GlobalSettings {
-    minimal_distance: f32,
-    maximal_distance: f32,
-    camera_lock: Transform,
-    current_distance: f32
-}
-
-#[derive(Default)]
-struct Orbit {
-    entity: Option<Entity>,
-    radius: f32,
-    color: Color
+    lock_settings: StaticLockSettings
 }
 
 #[derive(Default)]
@@ -52,9 +61,8 @@ struct Planet {
     color: Color
 }
 
-#[derive(Default)]
-struct Moon {
-    entity: Option<Entity>,
+#[derive(Default, Debug, Component)]
+struct Satelite {
     celestial: SelectableCelestialBody<u8>,
     color: Color,
 }
@@ -62,24 +70,31 @@ struct Moon {
 #[derive(Resource, Default)]
 struct Game {
     planet: Planet,
-    orbit: Orbit,
-    moon: Moon,
     settings: GlobalSettings,
     camera_transform: Transform,
-    current_focus: u8
+    camera_lock: CameraLock<u8>
+}
+
+#[derive(Component, Default)]
+struct Earth;
+
+fn load_data(mut load_elements: EventWriter<propagation::LoadElements>) {
+    load_elements.send(propagation::LoadElements { group: "galileo".to_owned(), format: "JSON".to_owned() });
 }
 
 fn setup_cameras(mut commands: Commands, mut game: ResMut<Game>) {
-    game.settings.camera_lock = Transform::from_translation(Vec3::ZERO);
-    game.settings.maximal_distance = 70.0;
-    game.settings.minimal_distance = 10.0;
-    game.settings.current_distance = 50.0;
+    game.settings.lock_settings = StaticLockSettings {
+        distance_min: 100.0,
+        distance_max: 700.0,
+        default_orientation: Vec3::Z,
+        tolerance: 1.0
+    };
     game.camera_transform = Transform::from_xyz(
         0.0,
-        game.settings.current_distance,
-        0.0,
+          0.0,
+        500.0,
     )
-    .looking_at(Vec3::ZERO, Vec3::Z);
+    .looking_at(Vec3::ZERO, Vec3::X);
     let camera = Camera3dBundle {
         transform: game.camera_transform,
         projection: PerspectiveProjection {
@@ -94,65 +109,110 @@ fn setup_cameras(mut commands: Commands, mut game: ResMut<Game>) {
     commands.spawn(camera);
 }
 
-fn setup(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, mut materials: ResMut<Assets<StandardMaterial>>, mut game: ResMut<Game>) {
+fn transition_to_playing(
+    mut next_state: ResMut<NextState<GameState>>,
+    mut ev_levelup: EventReader<AssetPrepared>,
+    mut game: ResMut<Game>
+) {
+    for ev in ev_levelup.read() {
+        game.planet.entity = Some(ev.entity_id.clone());
+        next_state.set(GameState::Playing);
+    }
+}
+
+fn setup(
+    mut commands: Commands, 
+    mut meshes: ResMut<Assets<Mesh>>, 
+    mut materials: ResMut<Assets<StandardMaterial>>, 
+    mut game: ResMut<Game>,
+    settings: Res<InGameSettings>
+) {
 
     let plane = InfinitePlane3d::new(Vec3::Y);
     commands.spawn(PointLightBundle {
-        transform: Transform::from_xyz(4.0, 30.0, 4.0),
+        transform: Transform::from_xyz(4.0, 90.0, 4.0),
         point_light: PointLight {
-            intensity: 5_000_000.0,
+            intensity: 15_000_000.0,
             shadows_enabled: true,
-            range: 50.0,
+            range: 500.0,
             ..default()
         },
         ..default()
     });
 
+    let moon_orbit = SatelliteOrbit {
+        semi_major_axis: 20000.0,
+        eccentricity: 0.001,
+        inclination: 5.0,
+        raan: 0.0,
+        argument_of_perigee: 20.0,
+        true_anomaly: 0.0,
+        epoch: 0.0,
+    };
+    let moon = Satelite {
+        celestial: SelectableCelestialBody::initialize_from_orbit(1000.0, 1, &moon_orbit, settings.scale),
+        color: WHITE_SMOKE.into(),
+    };
+
+    let moon_2_orbit = SatelliteOrbit {
+        semi_major_axis: 24000.0,
+        eccentricity: 0.15,
+        inclination: 12.0,
+        raan: 0.0,
+        argument_of_perigee: 90.0,
+        true_anomaly: 0.0,
+        epoch: 0.0
+    };
+
+    let moon_2 = Satelite {
+        celestial: SelectableCelestialBody::initialize_from_orbit(1500.0, 2, &moon_2_orbit, settings.scale),
+        color: GREEN_YELLOW.into(),
+    };
+
     game.planet.color = Color::linear_rgb(0.0, 0.0, 1.0);
-    game.moon.color = Color::linear_rgb(0.5, 0.5, 0.5);
-    game.orbit.color = Color::linear_rgb(0.5, 0.5, 0.0);
-    game.planet.celestial.radius = 2.0;
+    game.planet.celestial.radius = 6600.0 * settings.scale;
     game.planet.celestial.transform = Transform::from_translation(Vec3::ZERO);
     game.planet.celestial.orbital_plane = plane;
     game.planet.celestial.data = 0;
-    game.orbit.radius = 20.0;
-    game.moon.celestial.radius = 0.2;
-    game.moon.celestial.transform = Transform::from_translation(Vec3::NEG_X * game.orbit.radius);
-    game.moon.celestial.orbital_plane = plane;
-    game.moon.celestial.data = 1;
-    game.current_focus = 0;
 
-    let planet_shape = meshes.add(Sphere::default().mesh());
-    let moon_shape = meshes.add(Sphere::default().mesh());
-    let mut orbit = Torus::default();
-    orbit.minor_radius = 0.06;
-    orbit.major_radius = game.orbit.radius;
-    let orbit = meshes.add(orbit);
-    game.orbit.entity = Some(commands.spawn(
-        PbrBundle {
-            mesh: orbit,
-            transform: Transform::from_translation(Vec3::ZERO),
-            material: materials.add(game.orbit.color),
-            ..default()
-        }
-    ).id());
-    game.moon.entity = Some(commands.spawn(
-        PbrBundle {
+    let default_transform = Transform::from_xyz(
+        0.0,
+          0.0,
+        500.0,
+    )
+    .looking_at(Vec3::ZERO, Vec3::Y);
+    
+    game.camera_lock = CameraLock {
+        locked_on: 0, //planet
+        lock_transform: Transform::default(),
+        distance: default_transform.translation.length(),
+        is_default: true,
+        is_locked: true
+    };
+
+    let moon_shape = meshes.add(moon.celestial.get_mesh().mesh());
+    let moon_2_shape = meshes.add(moon_2.celestial.get_mesh().mesh());
+
+    let _ = commands.spawn(
+        (PbrBundle {
             mesh: moon_shape,
-            transform: game.moon.celestial.transform,
-            material: materials.add(game.moon.color),
+            transform: moon.celestial.transform,
+            material: materials.add(moon.color),
             ..default()
-        }
-    ).id());
-    game.planet.entity = Some(commands.spawn(
-        PbrBundle {
-            mesh: planet_shape,
-            transform: Transform::from_scale(Vec3::ONE * game.planet.celestial.radius),
-            material: materials.add(game.planet.color),
+        }, 
+        moon_orbit, 
+        moon)
+    ).id();
+    let _ = commands.spawn(
+        (PbrBundle {
+            mesh: moon_2_shape,
+            transform: moon_2.celestial.transform,
+            material: materials.add(moon_2.color),
             ..default()
-        }
-    ).id());
-    // spawn the game board
+        }, 
+        moon_2_orbit,
+        moon_2)
+    );
 }
 
 // remove all entities that are not a camera or window
@@ -162,32 +222,29 @@ fn teardown(mut commands: Commands, entities: Query<Entity, (Without<Camera>, Wi
     }
 }
 
-fn propagate_orbit(
+fn propagete_actual_orbit(
     time: Res<Time>,
+    settings: Res<InGameSettings>,
     mut game: ResMut<Game>,
-    mut transforms: Query<&mut Transform>
+    mut satelites: Query<(&mut Transform, &mut SatelliteOrbit, &mut Satelite)>
 ) {
-    const SPEED: f32 = 0.5;
-    let normal = game.moon.celestial.orbital_plane.normal.as_vec3();
-    let rotation = Quat::from_axis_angle(normal, SPEED * time.delta_seconds());
-    let planet_location = game.planet.celestial.transform.translation;
-    game.moon.celestial.transform.rotate_around(planet_location, rotation);
-    let Some(moon) = game.moon.entity else {
-        return;
-    };
-
-    if game.current_focus == game.moon.celestial.data {
-        game.settings.camera_lock = game.moon.celestial.transform;
-    }
-
-    if let Ok(mut mesh_transform) = transforms.get_mut(moon) {
-        *mesh_transform = game.moon.celestial.transform;
+    let dt = time.delta_seconds() * settings.simulation_speed;
+    for (mut transform, mut orbit, mut satelite) in satelites.iter_mut() {
+        let data = satelite.celestial.data;
+        *orbit = orbit.propagate(dt);
+        satelite.celestial.position_for(&*orbit, settings.scale);
+        *transform = satelite.celestial.transform;
+        // info!("Propagating orbit: {:?}, {:?} by {:?}", &orbit, &satelite.celestial, dt);
+        if game.camera_lock.locked_on == data {
+            game.camera_lock.lock_transform = transform.clone();
+        }
     }
 }
 
 fn change_focus(
     q_window: Query<&Window>,
     q_camera: Query<(&Camera, &GlobalTransform)>,
+    q_satelites: Query<(&Transform, &Satelite)>,
     buttons: Res<ButtonInput<MouseButton>>,
     mut game: ResMut<Game>
 ) {
@@ -205,38 +262,52 @@ fn change_focus(
         return;
     };
 
-    let selectables = ManySelectables::new(vec![game.planet.celestial.clone(), game.moon.celestial.clone()]);
+    let selectables = q_satelites.iter().map(|(t, s)| (t.clone(), s.celestial.clone())).chain(vec![(Transform::from_translation(Vec3::ZERO), game.planet.celestial.clone())]).collect();
 
-    let Some(selected) = selectables.select(ray) else {
+    let selectables = ManySelectables::new(selectables);
+
+    let Some((selected_transform, selected)) = selectables.select_with_context(ray) else {
         return;
     };
 
-    game.settings.camera_lock = selected.transform;
-    game.current_focus = selected.data;
+    game.camera_lock.lock_on(selected.data, selected_transform, selected.data == 0);
+}
+
+fn draw_orbits(
+    mut gizmos: Gizmos,
+    orbits: Query<(&Transform, &SatelliteOrbit)>,
+    settings: Res<InGameSettings>
+) {
+    gizmos.arrow(Vec3::ZERO, Vec3::Z * 70.0, DARK_GRAY);
+    gizmos.arrow(Vec3::ZERO, Vec3::Y * 70.0, DARK_GRAY);
+    gizmos.arrow(Vec3::ZERO, Vec3::X * 70.0, WHEAT);
+    for (pos, orbit) in orbits.iter() {
+        let (position, rotation, half_size) = orbit.bevy_elipse_parameters(settings.scale);
+        
+        // let true_anomaly_adjusted = orbit.true_anomaly as i32;
+        // if (true_anomaly_adjusted % 360).abs() < 10 {
+        //     gizmos.arrow(Vec3::ZERO, pos.translation, Color::WHITE);
+        // } else {
+        //     gizmos.arrow(Vec3::ZERO, pos.translation, Color::BLACK);
+        // }
+
+        gizmos.ellipse(position, rotation, half_size, Color::linear_rgb(1.0, 0.0, 0.0))
+            .resolution(64);
+    }
 }
 
 fn move_camera(
     time: Res<Time>,
     mut game: ResMut<Game>,
-    mut my_camera: Query<&mut Transform, With<Camera>>
+    mut my_camera: Query<&mut Transform, With<Camera>>,
 ) {    
     if time.delta_seconds() == 0.0 {
         return;
     }
-    const SPEED: f32 = 6.0;
-    let speed = SPEED * game.settings.maximal_distance / game.settings.current_distance;
-    let target_position = game.settings.camera_lock.translation + Vec3::Y * game.settings.current_distance;
-    let current_offset = target_position - game.camera_transform.translation;
-    let change = current_offset.normalize() * speed * time.delta_seconds();
-    let new_position = game.camera_transform.translation + change;
-    if current_offset.length() <= 0.1 {
-        game.camera_transform.translation = target_position;
-    } else {
-        game.camera_transform.translation = new_position;
-    }
     for mut camera in my_camera.iter_mut() {
-        info!("Moved from: {:?} to {:?}", camera, game.camera_transform);
-        *camera = game.camera_transform;
+        let settings = game.settings.lock_settings.clone();
+        game.camera_lock.move_towards_lock(&settings, &mut *camera, time.delta_seconds());
+        game.camera_transform = camera.clone();
     }
 }
 
@@ -254,11 +325,11 @@ fn scroll_update(
     keyboard_input: Res<ButtonInput<KeyCode>>,
     mut game: ResMut<Game>
 ) {
-    if keyboard_input.pressed(KeyCode::KeyI) {
-        let c = game.settings.current_distance;
-        game.settings.current_distance = game.settings.minimal_distance.max(c - 5.0);
-    } else if keyboard_input.pressed(KeyCode::KeyO) {
-        let c = game.settings.current_distance;
-        game.settings.current_distance = game.settings.maximal_distance.min(c + 5.0);
+    if keyboard_input.just_pressed(KeyCode::KeyI) {
+        let min = game.settings.lock_settings.distance_min;
+        game.camera_lock.zoom_in(50.0, min);
+    } else if keyboard_input.just_pressed(KeyCode::KeyO) {
+        let max = game.settings.lock_settings.distance_max;
+        game.camera_lock.zoom_out(50.0, max);
     }
 }

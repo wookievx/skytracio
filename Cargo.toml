@@ -1,5 +1,5 @@
 [package]
-name = "my_game"
+name = "game"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,3 +7,7 @@ edition = "2021"
 bevy = "0.14.2"
 rand = "0.8.5"
 rand_chacha = "0.3.1"
+approx = "0.5"
+sgp4 = "2.2.0"
+ureq = {version = "2.9.7", features = ["json"]}
+async-trait = "0.1.83"
